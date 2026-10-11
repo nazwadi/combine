@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -101,7 +102,10 @@ type fakeForum struct {
 	verifier      string
 	refreshes     atomic.Int32
 	tokenCalls    atomic.Int32
-	meStatus      atomic.Int32
+	accessStatus  atomic.Int32
+	accessCalls   atomic.Int32
+	accessBody    atomic.Value
+	rejectOld     atomic.Bool
 	refreshStatus atomic.Int32
 	userID        atomic.Int64
 }
@@ -109,7 +113,8 @@ type fakeForum struct {
 func makeForum(t *testing.T) *fakeForum {
 	t.Helper()
 	f := &fakeForum{}
-	f.meStatus.Store(200)
+	f.accessStatus.Store(200)
+	f.accessBody.Store("")
 	f.userID.Store(42)
 	f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -146,12 +151,27 @@ func makeForum(t *testing.T) *fakeForum {
 				}
 				_, _ = io.WriteString(w, `{"access_token":"access","refresh_token":"refresh","token_type":"bearer","expires_in":7200}`)
 			}
-		case "/api/me/":
+		case "/api/shadowrest/access/":
+			f.accessCalls.Add(1)
 			if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
 				t.Error("missing bearer token")
 			}
-			w.WriteHeader(int(f.meStatus.Load()))
-			_, _ = fmt.Fprintf(w, `{"me":{"user_id":%d,"username":"Test Player"}}`, f.userID.Load())
+			if r.Method != http.MethodGet {
+				t.Error("access check must GET")
+			}
+			if r.Header.Get("XF-Api-Key") != "" || r.Header.Get("XF-Api-User") != "" || r.URL.RawQuery != "" {
+				t.Error("OAuth access check must not send a machine key, identity override or permission bypass")
+			}
+			if f.rejectOld.Load() && r.Header.Get("Authorization") == "Bearer old-access" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.WriteHeader(int(f.accessStatus.Load()))
+			if body := f.accessBody.Load().(string); body != "" {
+				_, _ = io.WriteString(w, body)
+				return
+			}
+			_, _ = fmt.Fprintf(w, `{"allowed":true,"user_id":%d,"username":"Test Player"}`, f.userID.Load())
 		default:
 			w.WriteHeader(404)
 		}
@@ -200,7 +220,7 @@ func startLogin(t *testing.T, a *App) (string, []*http.Cookie, url.Values) {
 		t.Fatal(err)
 	}
 	q := u.Query()
-	if q.Get("code_challenge_method") != "S256" || q.Get("scope") != "user:read" {
+	if q.Get("code_challenge_method") != "S256" || q.Get("scope") != "shadowrest_access:read" {
 		t.Fatal("PKCE/scope missing")
 	}
 	return q.Get("state"), w.Result().Cookies(), q
@@ -407,23 +427,247 @@ func TestUpstreamOutageKeepsSessionButRevocationEndsIt(t *testing.T) {
 	f := makeForum(t)
 	a, store := makeApp(t, f)
 	cookie, s := seedSession(t, a, time.Now().Add(time.Hour))
-	f.meStatus.Store(503)
+	f.accessStatus.Store(503)
 	if w := request(a, "GET", "/account", []*http.Cookie{cookie}, nil); w.Code != 503 {
 		t.Fatal("outage allowed access")
 	}
 	if _, err := store.GetSession(context.Background(), s.Hash, time.Now().Unix()); err != nil {
 		t.Fatal("outage erased session")
 	}
-	f.meStatus.Store(403)
+	f.accessStatus.Store(403)
 	if w := request(a, "GET", "/account", []*http.Cookie{cookie}, nil); w.Code != 403 {
 		t.Fatal("forbidden status ignored")
 	}
-	f.meStatus.Store(401)
+	f.accessStatus.Store(401)
 	if w := request(a, "GET", "/account", []*http.Cookie{cookie}, nil); w.Code != 401 {
 		t.Fatal("revocation allowed access")
 	}
 	if _, err := store.GetSession(context.Background(), s.Hash, time.Now().Unix()); err != errMissing {
 		t.Fatal("revoked session retained")
+	}
+}
+
+func TestAccessDenialsPreserveSessionAndExplainCallback(t *testing.T) {
+	for _, code := range []string{
+		"shadowrest_account_not_valid", "shadowrest_sms_not_enrolled",
+		"shadowrest_oauth_client_inactive", "shadowrest_api_bypass_not_allowed",
+		"you_have_been_banned", "your_account_has_been_rejected", "your_account_has_been_disabled",
+		"your_account_is_currently_security_locked", "do_not_have_permission", "missing_scope",
+		"shadowrest_authentication_type_not_allowed", "login_required", "user_id_not_valid",
+		"user_id_not_allowed", "api_key_inactive", "unknown_future_denial",
+	} {
+		t.Run(code, func(t *testing.T) {
+			f := makeForum(t)
+			a, store := makeApp(t, f)
+			cookie, session := seedSession(t, a, time.Now().Add(time.Hour))
+			f.accessStatus.Store(403)
+			params := any([]string{}) // Native XenForo may encode empty params as [].
+			if code == "shadowrest_account_not_valid" {
+				params = map[string]string{"user_state": "email_confirm"}
+			}
+			body, _ := json.Marshal(map[string]any{"errors": []any{map[string]any{
+				"code": code, "message": "Complete the forum account requirement.", "params": params,
+			}}})
+			f.accessBody.Store(string(body))
+			_, err := a.fetchAccess(context.Background(), &oauth2.Token{AccessToken: "fixture"})
+			var denial *AccessDenial
+			if !errors.As(err, &denial) || denial.Code != code {
+				t.Fatalf("structured denial lost: %v", err)
+			}
+			if code == "shadowrest_account_not_valid" && denial.UserState != "email_confirm" {
+				t.Fatal("account-state detail lost")
+			}
+			wantMessage := "Complete the forum account requirement."
+			if code == "missing_scope" {
+				wantMessage = "log out of the demo and sign in again"
+			}
+			w := request(a, "GET", "/account", []*http.Cookie{cookie}, nil)
+			if w.Code != 403 || !strings.Contains(w.Body.String(), wantMessage) || w.Header().Get("Location") != "" {
+				t.Fatal("policy denial was hidden or redirected to login")
+			}
+			if _, err := store.GetSession(context.Background(), session.Hash, time.Now().Unix()); err != nil {
+				t.Fatal("policy denial deleted the local session")
+			}
+			if f.refreshes.Load() != 0 {
+				t.Fatal("policy denial triggered a refresh")
+			}
+			state, cookies, _ := startLogin(t, a)
+			w = request(a, "GET", "/auth/callback?code=x&state="+state, cookies, nil)
+			if w.Code != 403 || !strings.Contains(w.Body.String(), wantMessage) || len(w.Result().Cookies()) != 0 {
+				t.Fatal("callback denial created a session or became an upstream failure")
+			}
+			if len(store.sessions) != 1 {
+				t.Fatal("denied callback changed the existing session set")
+			}
+			// The same local session becomes usable after the forum policy allows it.
+			f.accessStatus.Store(200)
+			f.accessBody.Store("")
+			if w := request(a, "GET", "/account", []*http.Cookie{cookie}, nil); w.Code != 200 {
+				t.Fatal("policy recovery required an unnecessary new login")
+			}
+		})
+	}
+}
+
+func TestAccessDenialTextIsEscapedAndBounded(t *testing.T) {
+	f := makeForum(t)
+	a, _ := makeApp(t, f)
+	cookie, _ := seedSession(t, a, time.Now().Add(time.Hour))
+	f.accessStatus.Store(403)
+	message := "<script>alert('no')</script>\n" + strings.Repeat("x", 600)
+	body, _ := json.Marshal(map[string]any{"errors": []any{map[string]any{"code": "no_permission", "message": message, "params": []string{}}}})
+	f.accessBody.Store(string(body))
+	w := request(a, "GET", "/account", []*http.Cookie{cookie}, nil)
+	if w.Code != 403 || strings.Contains(w.Body.String(), "<script>") || !strings.Contains(w.Body.String(), "&lt;script&gt;") || strings.Contains(w.Body.String(), strings.Repeat("x", 501)) {
+		t.Fatal("upstream denial text was not safely rendered")
+	}
+	f.accessBody.Store("not JSON")
+	w = request(a, "GET", "/account", []*http.Cookie{cookie}, nil)
+	if w.Code != 403 || !strings.Contains(w.Body.String(), "currently denying access") {
+		t.Fatal("malformed 403 lost the generic access-denied fallback")
+	}
+}
+
+func TestAccessRequiresExplicitValidAllowance(t *testing.T) {
+	for name, body := range map[string]string{
+		"missing allowance": `{"user_id":42,"username":"Player"}`,
+		"false allowance":   `{"allowed":false,"user_id":42,"username":"Player"}`,
+		"null allowance":    `{"allowed":null,"user_id":42,"username":"Player"}`,
+		"string allowance":  `{"allowed":"true","user_id":42,"username":"Player"}`,
+		"missing ID":        `{"allowed":true,"username":"Player"}`,
+		"invalid ID":        `{"allowed":true,"user_id":0,"username":"Player"}`,
+		"blank username":    `{"allowed":true,"user_id":42,"username":" "}`,
+		"trailing data":     `{"allowed":true,"user_id":42,"username":"Player"} {}`,
+		"oversized":         `{"allowed":true,"user_id":42,"username":"Player","extra":"` + strings.Repeat("x", 1<<20) + `"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := makeForum(t)
+			a, store := makeApp(t, f)
+			cookie, session := seedSession(t, a, time.Now().Add(time.Hour))
+			f.accessBody.Store(body)
+			if w := request(a, "GET", "/account", []*http.Cookie{cookie}, nil); w.Code != 503 {
+				t.Fatalf("malformed allowance returned %d", w.Code)
+			}
+			if _, err := store.GetSession(context.Background(), session.Hash, time.Now().Unix()); err != nil {
+				t.Fatal("bad upstream payload erased the local session")
+			}
+			state, cookies, _ := startLogin(t, a)
+			if w := request(a, "GET", "/auth/callback?code=x&state="+state, cookies, nil); w.Code != 502 || len(w.Result().Cookies()) != 0 {
+				t.Fatal("malformed callback allowance created a session")
+			}
+		})
+	}
+}
+
+func TestAccess401RefreshesOnceAndPersistsRotatedPair(t *testing.T) {
+	f := makeForum(t)
+	a, store := makeApp(t, f)
+	cookie, session := seedSession(t, a, time.Now().Add(time.Hour))
+	f.rejectOld.Store(true)
+	if w := request(a, "GET", "/account", []*http.Cookie{cookie}, nil); w.Code != 200 {
+		t.Fatalf("401 recovery returned %d", w.Code)
+	}
+	if f.refreshes.Load() != 1 || f.accessCalls.Load() != 2 {
+		t.Fatal("401 recovery did not refresh and retry exactly once")
+	}
+	stored, err := store.GetSession(context.Background(), session.Hash, time.Now().Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := a.decodeToken(stored)
+	if err != nil || token.AccessToken != "new-access" || token.RefreshToken != "new-refresh" {
+		t.Fatal("401 recovery did not persist the rotated pair")
+	}
+	if w := request(a, "GET", "/account", []*http.Cookie{cookie}, nil); w.Code != 200 || f.refreshes.Load() != 1 {
+		t.Fatal("later request did not reuse the persisted token")
+	}
+}
+
+func TestPersistentAccess401EndsSessionWithoutRefreshLoop(t *testing.T) {
+	for _, expired := range []bool{false, true} {
+		t.Run(fmt.Sprint(expired), func(t *testing.T) {
+			f := makeForum(t)
+			a, store := makeApp(t, f)
+			expiry := time.Now().Add(time.Hour)
+			wantAccessCalls := int32(2)
+			if expired {
+				expiry = time.Now().Add(-time.Minute)
+				wantAccessCalls = 1
+			}
+			cookie, session := seedSession(t, a, expiry)
+			f.accessStatus.Store(401)
+			if w := request(a, "GET", "/account", []*http.Cookie{cookie}, nil); w.Code != 401 {
+				t.Fatal("persistent 401 allowed access")
+			}
+			if f.refreshes.Load() != 1 || f.accessCalls.Load() != wantAccessCalls {
+				t.Fatal("request exceeded one refresh or retried unexpectedly")
+			}
+			if _, err := store.GetSession(context.Background(), session.Hash, time.Now().Unix()); err != errMissing {
+				t.Fatal("invalid authorization retained the session")
+			}
+		})
+	}
+}
+
+func TestAccess401RefreshFailureClassification(t *testing.T) {
+	for _, status := range []int{400, 503} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			f := makeForum(t)
+			a, store := makeApp(t, f)
+			cookie, session := seedSession(t, a, time.Now().Add(time.Hour))
+			f.accessStatus.Store(401)
+			f.refreshStatus.Store(int32(status))
+			w := request(a, "GET", "/account", []*http.Cookie{cookie}, nil)
+			_, err := store.GetSession(context.Background(), session.Hash, time.Now().Unix())
+			if status == 400 && (w.Code != 401 || err != errMissing) {
+				t.Fatal("invalid refresh after 401 did not end the session")
+			}
+			if status == 503 && (w.Code != 503 || err != nil) {
+				t.Fatal("temporary refresh failure after 401 did not preserve the session")
+			}
+			if f.refreshes.Load() != 1 || f.accessCalls.Load() != 1 {
+				t.Fatal("failed refresh retried the access endpoint")
+			}
+		})
+	}
+}
+
+func TestAccessNetworkFailureKeepsSession(t *testing.T) {
+	f := makeForum(t)
+	a, store := makeApp(t, f)
+	cookie, session := seedSession(t, a, time.Now().Add(time.Hour))
+	f.server.Close()
+	if w := request(a, "GET", "/account", []*http.Cookie{cookie}, nil); w.Code != 503 {
+		t.Fatal("network failure allowed access")
+	}
+	if _, err := store.GetSession(context.Background(), session.Hash, time.Now().Unix()); err != nil {
+		t.Fatal("network failure erased the session")
+	}
+}
+
+func TestAccessUnavailableKeepsSession(t *testing.T) {
+	f := makeForum(t)
+	a, store := makeApp(t, f)
+	cookie, session := seedSession(t, a, time.Now().Add(time.Hour))
+	f.accessStatus.Store(http.StatusServiceUnavailable)
+	f.accessBody.Store(`{"errors":[{"code":"shadowrest_access_unavailable","message":"The access service is temporarily unavailable.","params":[]}]}`)
+	w := request(a, "GET", "/account", []*http.Cookie{cookie}, nil)
+	if w.Code != http.StatusServiceUnavailable || strings.Contains(w.Body.String(), "allowed Shadowrest access") {
+		t.Fatal("unavailable add-on allowed access")
+	}
+	if w.Header().Get("Location") != "" || len(w.Result().Cookies()) != 0 {
+		t.Fatal("unavailable add-on restarted login or changed its cookie")
+	}
+	if _, err := store.GetSession(context.Background(), session.Hash, time.Now().Unix()); err != nil {
+		t.Fatal("unavailable add-on erased the local session")
+	}
+	if f.accessCalls.Load() != 1 || f.tokenCalls.Load() != 0 {
+		t.Fatal("unavailable add-on triggered a retry or token refresh")
+	}
+	f.accessStatus.Store(http.StatusOK)
+	f.accessBody.Store("")
+	if w := request(a, "GET", "/account", []*http.Cookie{cookie}, nil); w.Code != http.StatusOK {
+		t.Fatal("restored access service did not accept the retained session")
 	}
 }
 

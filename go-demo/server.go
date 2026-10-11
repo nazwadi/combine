@@ -60,7 +60,7 @@ func newApp(c Config, s Secrets, store Store) (*App, error) {
 		config: c, store: store, aead: aead, views: views,
 		configured: s.OAuthClientID != "" && s.OAuthClientSecret != "",
 		client:     &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
-		oauth:      oauth2.Config{ClientID: s.OAuthClientID, ClientSecret: s.OAuthClientSecret, RedirectURL: c.PublicBaseURL + "/auth/callback", Scopes: []string{"user:read"}, Endpoint: oauth2.Endpoint{AuthURL: c.ForumBaseURL + "/oauth2/authorize", TokenURL: c.ForumBaseURL + "/api/oauth2/token", AuthStyle: oauth2.AuthStyleInParams}},
+		oauth:      oauth2.Config{ClientID: s.OAuthClientID, ClientSecret: s.OAuthClientSecret, RedirectURL: c.PublicBaseURL + "/auth/callback", Scopes: []string{"shadowrest_access:read"}, Endpoint: oauth2.Endpoint{AuthURL: c.ForumBaseURL + "/oauth2/authorize", TokenURL: c.ForumBaseURL + "/api/oauth2/token", AuthStyle: oauth2.AuthStyleInParams}},
 	}, nil
 }
 
@@ -211,13 +211,15 @@ func (a *App) callback(w http.ResponseWriter, r *http.Request) {
 		a.render(w, 502, View{Title: "Unable to complete sign-in", Message: "The forum could not complete this sign-in. Please start again."})
 		return
 	}
-	identity, err := a.fetchIdentity(r.Context(), token)
-	if err != nil {
-		a.render(w, 502, View{Title: "Unable to verify your account", Message: "The forum did not confirm your identity. Please try signing in again."})
+	identity, err := a.fetchAccess(r.Context(), token)
+	if errors.Is(err, errAccessDenied) {
+		a.render(w, 403, View{Title: "Shadowrest access is unavailable", Message: accessDenialMessage(err)})
 		return
 	}
-	// Future policy API: require eligibility here before creating a session,
-	// and in authenticated before returning success for each protected request.
+	if err != nil {
+		a.render(w, 502, View{Title: "Unable to verify your account", Message: "The forum did not confirm access to your account. Please try signing in again."})
+		return
+	}
 	cookie := randomValue()
 	now := time.Now()
 	s := Session{Hash: hashValue(cookie), CSRF: randomValue(), UserID: identity.UserID, Username: identity.Username, CreatedAt: now.Unix(), ExpiresAt: now.Add(time.Duration(a.config.SessionHours) * time.Hour).Unix()}
@@ -304,32 +306,24 @@ func (a *App) authenticated(ctx context.Context, hash string) (Session, *oauth2.
 	if err != nil {
 		return s, nil, errUpstream
 	}
+	refreshed := false
 	if !token.Valid() {
-		// Refresh rotates both tokens at XenForo. Keep this operation alive long
-		// enough to persist the replacement even if its browser request cancels.
-		refreshCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
-		defer cancel()
-		fresh, err := a.oauth.TokenSource(a.oauthContext(refreshCtx), token).Token()
+		s, token, err = a.refreshSession(ctx, s, token)
 		if err != nil {
-			if permanentTokenError(err) {
-				_ = a.store.DeleteSession(refreshCtx, hash)
-				return s, nil, errLoginRequired
-			}
-			return s, nil, errUpstream
+			return s, nil, err
 		}
-		if fresh.AccessToken == "" || fresh.RefreshToken == "" || !strings.EqualFold(fresh.TokenType, "bearer") || fresh.Expiry.IsZero() {
-			return s, nil, errUpstream
-		}
-		encoded, err := a.encodeToken(fresh, hash)
-		if err != nil {
-			return s, nil, errUpstream
-		}
-		if err := a.store.UpdateToken(refreshCtx, hash, encoded, time.Now().Unix()); err != nil {
-			return s, nil, errUpstream
-		}
-		s.Token, token = encoded, fresh
+		refreshed = true
 	}
-	identity, err := a.fetchIdentity(ctx, token)
+	identity, err := a.fetchAccess(ctx, token)
+	if errors.Is(err, errLoginRequired) && !refreshed {
+		// The forum may expire a token before our local clock does. Retry once,
+		// counting an expiry-triggered refresh above toward the same limit.
+		s, token, err = a.refreshSession(ctx, s, token)
+		if err != nil {
+			return s, nil, err
+		}
+		identity, err = a.fetchAccess(ctx, token)
+	}
 	if errors.Is(err, errLoginRequired) {
 		_ = a.store.DeleteSession(context.WithoutCancel(ctx), hash)
 		return s, nil, errLoginRequired
@@ -341,10 +335,37 @@ func (a *App) authenticated(ctx context.Context, hash string) (Session, *oauth2.
 		_ = a.store.DeleteSession(context.WithoutCancel(ctx), hash)
 		return s, nil, errLoginRequired
 	}
-	// Add the future Shadowrest access-policy call here, before returning success.
-	// /api/me/ confirms identity only; it is not an SMS enrollment/access check.
 	s.Username = identity.Username
 	return s, token, nil
+}
+
+// The caller holds the session lock. Preserve the rotated pair before making
+// another access request, even when the originating browser request is canceled.
+func (a *App) refreshSession(ctx context.Context, s Session, token *oauth2.Token) (Session, *oauth2.Token, error) {
+	refreshCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+	defer cancel()
+	expired := *token
+	expired.Expiry = time.Now().Add(-time.Minute) // Force refresh after an API 401 too.
+	fresh, err := a.oauth.TokenSource(a.oauthContext(refreshCtx), &expired).Token()
+	if err != nil {
+		if permanentTokenError(err) {
+			_ = a.store.DeleteSession(refreshCtx, s.Hash)
+			return s, nil, errLoginRequired
+		}
+		return s, nil, errUpstream
+	}
+	if fresh == nil || fresh.AccessToken == "" || fresh.RefreshToken == "" || !strings.EqualFold(fresh.TokenType, "bearer") || fresh.Expiry.IsZero() {
+		return s, nil, errUpstream
+	}
+	encoded, err := a.encodeToken(fresh, s.Hash)
+	if err != nil {
+		return s, nil, errUpstream
+	}
+	if err := a.store.UpdateToken(refreshCtx, s.Hash, encoded, time.Now().Unix()); err != nil {
+		return s, nil, errUpstream
+	}
+	s.Token = encoded
+	return s, fresh, nil
 }
 
 func (a *App) account(w http.ResponseWriter, r *http.Request) {
@@ -355,7 +376,7 @@ func (a *App) account(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if errors.Is(err, errAccessDenied) {
-		a.render(w, 403, View{Title: "Forum access is unavailable", Message: "The forum is currently denying access to this account.", SignedIn: true, CSRF: s.CSRF})
+		a.render(w, 403, View{Title: "Shadowrest access is unavailable", Message: accessDenialMessage(err), SignedIn: true, CSRF: s.CSRF})
 		return
 	}
 	if err != nil {

@@ -1,7 +1,7 @@
 # Go OAuth demo
 
 A standalone, local Go application demonstrating XenForo OAuth login, a persistent
-local session, an authenticated API request and logout. It needs only Go. It uses
+local session, a central account-access check and logout. It needs only Go. It uses
 a private JSON file rather than MariaDB or SQLite, and runs without Docker,
 nginx, Anubis, PHP, Node or a frontend build system.
 
@@ -40,7 +40,7 @@ encryption key on first startup.
 ## Enable forum login
 
 In the XenForo ACP, use Setup > Service providers > OAuth2 clients. Use a
-confidential, active development client with the **user:read** scope and this
+confidential, active development client with the **shadowrest_access:read** scope and this
 exact redirect URI:
 
 ```text
@@ -50,6 +50,14 @@ http://localhost:18080/auth/callback
 You can enter the existing development client's credentials if its registered
 callback matches; a separate workstation client lets you revoke it independently.
 The demo does not create a client or alter forum settings for you.
+
+The forum must have the Shadowrest access endpoint installed first. This demo
+requests only its access scope; it does not request the reserved game verification
+scope or the broader user:read scope. When upgrading an existing demo login,
+enable shadowrest_access:read for its OAuth client, then log out of the demo and
+sign in again to authorize that scope. Refreshing an old token does not add it.
+See the [forum access API contract](docs/forum-access-api.md) for the response
+format, native and Shadowrest failure codes, and future login-server integration.
 
 Edit **config.json**, setting client_id and client_secret, then restart go run.
 Keep this file private; it is ignored by Git. Do not put credentials in the HTML.
@@ -117,7 +125,7 @@ GODEMO_WEBDRIVER_URL=http://127.0.0.1:9515 go test -race -run TestBrowserLogoutF
 | main.go | Read config, open local state, start/stop HTTP server |
 | config.go | Configuration, automatic key and encryption helpers |
 | server.go | Routes, OAuth flow, refresh and local logout |
-| forum.go | Authenticated forum identity API call; future policy integration |
+| forum.go | Authenticated access API call, response validation and denial reasons |
 | store.go | Small persistent JSON store and one-process lock |
 | templates/page.html | Page markup and text |
 | assets/demo.css | Small stylesheet |
@@ -125,15 +133,30 @@ GODEMO_WEBDRIVER_URL=http://127.0.0.1:9515 go test -race -run TestBrowserLogoutF
 
 The flow is /login -> forum authorization -> /auth/callback -> /account.
 The callback checks browser-bound, single-use state, exchanges the code with
-PKCE, and requests /api/me/ for the forum ID. The browser gets a random local
-session cookie; OAuth tokens remain server-side. /account refreshes an expired
-token if needed and calls /api/me/ again. The home page's greeting is only cached
-session information; /account is the authenticated request demonstration.
+PKCE, and requests GET /api/shadowrest/access/ with the bearer token. The endpoint
+must return HTTP 200 with allowed:true, a positive user_id and a nonblank username
+before the demo creates a session. Missing or malformed fields fail closed. The
+browser gets a random local session cookie; OAuth tokens remain server-side.
 
-The future access-policy API belongs next to fetchIdentity in forum.go, called
-from the sign-in and authenticated-request paths. At present /api/me/ confirms
-identity only. This demo does **not** enforce the proposed Shadowrest SMS
-enrollment, confirmed-account or game eligibility policy.
+/account refreshes an expired token if needed, then calls the access endpoint on
+every request and checks that the returned ID matches the local session's ID.
+An HTTP 401 can trigger one refresh and retry; a refresh already performed for
+expiration counts toward that same limit. New token pairs are saved before retry.
+Persistent 401 or an invalid refresh grant ends the local session. A network/5xx
+failure denies access but keeps the session for a later retry.
+
+HTTP 403 presents the forum's structured denial message as escaped, bounded text,
+with a generic fallback if its response is unreadable. It keeps an existing local
+session and does not send the user into a login loop. Missing scope gets a setup
+and reauthorization explanation. The callback also shows intentional 403 denials
+without creating a new session. The forum owns the account-state, ban and SMS
+enrollment policy; the Go app does not duplicate those rules or perform game SMS
+verification.
+
+The home page's greeting is cached session information, not proof of current
+eligibility. /account is the protected-request demonstration; future protected
+routes should use authenticated too. There is no fallback to /api/me/ if the
+Shadowrest endpoint is absent or denies access.
 
 ## Local state and logout
 

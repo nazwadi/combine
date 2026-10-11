@@ -18,12 +18,12 @@
           <dl><dt>Forum name</dt><dd>{{.Username}}</dd><dt>Forum user ID</dt><dd>{{.UserID}}</dd></dl>
         {{end}}
         {{if .Account}}
-          <p>Your forum identity was just checked using <code>/api/me/</code>.</p>
+          <p>The forum just confirmed your identity and allowed Shadowrest access.</p>
         {{else}}
-          <p>This page shows your saved local session. Use the button below to check your forum identity again.</p>
+          <p>This page shows your saved local session. Use the button below to check your current Shadowrest access.</p>
         {{end}}
         <div class="actions">
-          <a class="button primary" href="/account">Check forum identity</a>
+          <a class="button primary" href="/account">Check Shadowrest access</a>
           <form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Log out of demo</button></form>
         </div>
         <p class="muted">Logout ends this demo’s session. It leaves your forum login unchanged.</p>
@@ -37,7 +37,7 @@
         {{end}}
       {{end}}
     </section>
-    <footer>Local development demo · Forum identity only</footer>
+    <footer>Local development demo · Shadowrest account access</footer>
   </main>
 </body>
 </html>
