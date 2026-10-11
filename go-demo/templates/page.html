@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>{{.Title}} · Go OAuth demo</title>
+  <link rel="stylesheet" href="/assets/demo.css">
+</head>
+<body>
+  <main>
+    <nav aria-label="Navigation"><a href="/">Go OAuth demo</a><a href="{{.ForumURL}}/">Shadowrest forums</a></nav>
+    <section>
+      <h1>{{.Title}}</h1>
+      {{if .Message}}<p class="notice" role="status">{{.Message}}</p>{{end}}
+      {{if .SignedIn}}
+        {{if .Username}}
+          <dl><dt>Forum name</dt><dd>{{.Username}}</dd><dt>Forum user ID</dt><dd>{{.UserID}}</dd></dl>
+        {{end}}
+        {{if .Account}}
+          <p>Your forum identity was just checked using <code>/api/me/</code>.</p>
+        {{else}}
+          <p>This page shows your saved local session. Use the button below to check your forum identity again.</p>
+        {{end}}
+        <div class="actions">
+          <a class="button primary" href="/account">Check forum identity</a>
+          <form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Log out of demo</button></form>
+        </div>
+        <p class="muted">Logout ends this demo’s session. It leaves your forum login unchanged.</p>
+      {{else}}
+        <p>Sign in with your Shadowrest forum account, return here, and try logging out.</p>
+        {{if .Configured}}
+          <a class="button primary" href="/login">Log in with Shadowrest</a>
+        {{else}}
+          <button type="button" disabled>Sign-in not configured</button>
+          <p class="muted">Set client_id and client_secret in config.json, then restart the app. See README.md for setup.</p>
+        {{end}}
+      {{end}}
+    </section>
+    <footer>Local development demo · Forum identity only</footer>
+  </main>
+</body>
+</html>

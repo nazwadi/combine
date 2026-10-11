@@ -1,0 +1,8 @@
+{
+  "listen_addr": "127.0.0.1:18080",
+  "public_base_url": "http://localhost:18080",
+  "forum_base_url": "https://forums.shadowrest.org",
+  "client_id": "",
+  "client_secret": "",
+  "data_dir": "data"
+}
